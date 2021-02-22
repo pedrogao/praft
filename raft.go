@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -56,6 +58,7 @@ type ConsensusModule struct {
 	commitChan chan<- CommitEntry // 提交队列
 
 	newCommitReadyChan chan struct{} // 新提交准备
+	triggerAEChan      chan struct{} // AppendEntries 需要发送
 
 	// persistent Raft state
 	currentTerm int        // 当前任期
@@ -71,21 +74,30 @@ type ConsensusModule struct {
 	// volatile Raft leader state
 	nextIndex  map[int]int // 下一个日志序号
 	matchIndex map[int]int // 已匹配日志序号
+
+	// persistence
+	storage Storage
 }
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16) // 带一个 16 的缓冲，防止过度等待
+	cm.triggerAEChan = make(chan struct{}, 1)       // AE 发送
 	cm.state = Follower                             // 刚开始是 Follower，超时后变成 Candidate
 	cm.votedFor = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+
+	if cm.storage.HasData() {
+		cm.restoreFromStorage(cm.storage)
+	}
 
 	go func() {
 		<-ready
@@ -103,17 +115,19 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 // leader 提交 command 日志
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	cm.dlog("Submit received by %v: %v", cm.state, command)
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{
 			Command: command,
 			Term:    cm.currentTerm,
 		})
+		cm.persistToStorage() // 更新 log 后持久化
 		cm.dlog("... log=%v", cm.log)
+		cm.mu.Unlock()
+		cm.triggerAEChan <- struct{}{} // 需要发送 AE
 		return true
 	}
+	cm.mu.Unlock()
 	return false
 }
 
@@ -299,27 +313,48 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // 成为 Leader
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
-	go func() {
-		// 50ms 一次
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-
+	go func(heartbeatTimeout time.Duration) {
+		cm.leaderSendAEs()
+		t := time.NewTimer(heartbeatTimeout)
+		defer t.Stop()
 		// 向 follower 发送心跳
 		for {
-			// 发送心跳
-			cm.leaderSendHeartbeats()
-			<-ticker.C
+			doSend := false
+			select {
+			case <-t.C: // 50ms 以后
+				doSend = true
+				t.Stop()
+				t.Reset(heartbeatTimeout)
+			case _, ok := <-cm.triggerAEChan: // 或者有东西需要发送
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
 
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(heartbeatTimeout)
 			}
-			cm.mu.Unlock()
+			if doSend {
+				// 发送心跳
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
 type AppendEntriesArgs struct {
@@ -403,7 +438,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 }
 
 // leader 发送心跳
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
@@ -444,8 +479,6 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					if reply.Success { // 心跳发送成功
 						cm.nextIndex[peerId] = ni + len(entries)         // 更新 nextIndex
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1 // 更新 matchIndex
-						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
-
 						savedCommitIndex := cm.commitIndex
 						// 从 commitIndex + 1 开始，依次查看，更新 commitIndex
 						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
@@ -461,10 +494,12 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 								}
 							}
 						}
+						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
 						// 更新了 commitIndex
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{} // leader 更新 commitIndex 需要发送 AE
 						}
 					} else {
 						cm.nextIndex[peerId] = ni - 1 // 如果日志同步失败，则向后一步，然后继续下一次同步
@@ -508,6 +543,55 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 		return lastIndex, cm.log[lastIndex].Term
 	} else {
 		return -1, -1 // -1 表示还没有任何数据
+	}
+}
+
+// 持久化数据
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
+}
+
+// 恢复数据
+func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
+	if termData, found := cm.storage.Get("currentTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+	if voteData, found := cm.storage.Get("votedFor"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(voteData))
+		if err := d.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+	if logData, found := cm.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
 	}
 }
 
