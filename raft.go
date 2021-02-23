@@ -14,17 +14,6 @@ import (
 
 const DebugCM = 1
 
-type LogEntry struct {
-	Command interface{}
-	Term    int
-}
-
-type CommitEntry struct {
-	Command interface{}
-	Index   int
-	Term    int
-}
-
 type CMState int
 
 const (
@@ -49,6 +38,26 @@ func (s CMState) String() string {
 	}
 }
 
+// 日志项
+type LogEntry struct {
+	Command interface{} // 命令
+	Term    int         // 任期
+}
+
+// 提交项
+// CommitEntry is the data reported by Raft to the commit channel. Each commit
+// entry notifies the client that consensus was reached on a command and it can
+// be applied to the client's state machine.
+// 每一个 CommitEntry 表示客户端已经收到了 Raft 服务的确认命令，并且客户端也可以将 CommitEntry
+// 应用到自己的状态机中
+type CommitEntry struct {
+	Command interface{} // 命令
+	Index   int         // 序号
+	Term    int         // 任期
+}
+
+// 共识模块
+// Raft 执行体
 type ConsensusModule struct {
 	mu      sync.Mutex // 锁
 	id      int        // 当前模块id
@@ -57,6 +66,7 @@ type ConsensusModule struct {
 
 	commitChan chan<- CommitEntry // 提交队列
 
+	// sync channel
 	newCommitReadyChan chan struct{} // 新提交准备
 	triggerAEChan      chan struct{} // AppendEntries 需要发送
 
@@ -79,6 +89,7 @@ type ConsensusModule struct {
 	storage Storage
 }
 
+// 新建 Raft 共识
 func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
@@ -94,25 +105,26 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
-
+	// 如果 storage 中有状态数据，则恢复
 	if cm.storage.HasData() {
 		cm.restoreFromStorage(cm.storage)
 	}
 
 	go func() {
-		<-ready
+		<-ready // 准备完成，即开始选举
 		cm.mu.Lock()
 		cm.electionResetEvent = time.Now() // 重置选举时间
 		cm.mu.Unlock()
 		cm.runElectionTimer() // 开始选举
 	}()
 
-	go cm.commitChanSender()
+	// 开始日志提交 loop
+	go cm.commitLoop()
 
 	return cm
 }
 
-// leader 提交 command 日志
+// 提交 command 日志
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
 	cm.dlog("Submit received by %v: %v", cm.state, command)
@@ -131,12 +143,14 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 	return false
 }
 
+// ConsensusModule 状态反馈
 func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
+// 停止服务
 func (cm *ConsensusModule) Stop() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -145,7 +159,7 @@ func (cm *ConsensusModule) Stop() {
 	close(cm.newCommitReadyChan)
 }
 
-// 开始选举
+// 选举定时器，选举操作在 10ms 后超时，然后开始选举，无论选举结果如何，也会开始下一轮选举
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
@@ -181,7 +195,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	}
 }
 
-// 开始选举
+// 请求投票
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate // 变更状态
 	cm.currentTerm += 1
@@ -237,68 +251,6 @@ func (cm *ConsensusModule) startElection() {
 	go cm.runElectionTimer()
 }
 
-// 随机返回选举超时时间，150ms ～ 300ms
-func (cm *ConsensusModule) electionTimeout() time.Duration {
-	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
-		return time.Duration(150) * time.Millisecond
-	} else {
-		return time.Duration(150+rand.Intn(150)) * time.Millisecond
-	}
-}
-
-// Debug 输出日志信息
-func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
-	if DebugCM > 0 {
-		format = fmt.Sprintf("[%d] ", cm.id) + format
-		log.Printf(format, args...)
-	}
-}
-
-// 选举投票请求
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-// 选举投票回复
-type RequestVoteReply struct {
-	Term         int
-	VotedGranted bool
-}
-
-// 请求投票 RPC
-func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	// 死亡状态，直接返回
-	if cm.state == Dead {
-		return nil
-	}
-	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
-	// 如果对方的任期大于当前任期，直接变成 Follower
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in RequestVote")
-		cm.becomeFollower(args.Term)
-	}
-	// 如果对方的任期等于当前任期 且 （当前未投票 或者 投票的人正是发请求的人）
-	// 那么将当前任期的一票投给请求者
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
-		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
-		reply.VotedGranted = true
-		cm.votedFor = args.CandidateId
-		cm.electionResetEvent = time.Now() // 票已投，当前选举结束，进入下一个选举
-	} else { // 其它的情况，都不进行投票
-		reply.VotedGranted = false
-	}
-	reply.Term = cm.currentTerm
-	cm.dlog("... RequestVote: %+v", reply)
-	return nil
-}
-
 // 当前节点成为 Follower
 func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
@@ -307,23 +259,54 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.votedFor = -1                   // 成为追随者，我票谁也没投
 	cm.electionResetEvent = time.Now() // 重置选举时间
 
-	go cm.runElectionTimer() // 重新开始选举
+	go cm.runElectionTimer() // 重新开始选举计时
 }
+
+// 日志提交 loop，当 commitIndex 更新
+func (cm *ConsensusModule) commitLoop() {
+	// 当 newCommitReadyChan 中有新的 commit 信号来领的时候，即会向 commitChan 中提交日志
+	for range cm.newCommitReadyChan {
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+		var entries []LogEntry
+		if cm.commitIndex > cm.lastApplied {
+			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1] // 需要应用的日志
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.dlog("commitLoop entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
+	cm.dlog("commitLoop done")
+}
+
+//
+// ConsensusModule Leader 独有的操作
+//
 
 // 成为 Leader
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+	// 成为 leader，开始更新每个 peer 的日志情况
 	for _, peerId := range cm.peerIds {
-		cm.nextIndex[peerId] = len(cm.log)
-		cm.matchIndex[peerId] = -1
+		cm.nextIndex[peerId] = len(cm.log) // 下一个要发送的日志序号 len(cm.log)
+		cm.matchIndex[peerId] = -1         // 匹配的日志序号，未匹配，所以是 -1
 	}
 	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
-
 	go func(heartbeatTimeout time.Duration) {
-		cm.leaderSendAEs()
+		cm.sendAppendEntries()
 		t := time.NewTimer(heartbeatTimeout)
 		defer t.Stop()
-		// 向 follower 发送心跳
+		// 向 follower 发送心跳或者同步日志
+		// 注意：是死循环
 		for {
 			doSend := false
 			select {
@@ -351,94 +334,14 @@ func (cm *ConsensusModule) startLeader() {
 					return
 				}
 				cm.mu.Unlock()
-				cm.leaderSendAEs()
+				cm.sendAppendEntries()
 			}
 		}
 	}(50 * time.Millisecond)
 }
 
-type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-// 处理追加日志请求
-func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
-		return nil
-	}
-	cm.dlog("AppendEntries: %+v", args)
-	// 如果请求者的任期比我大，直接成为 Follower
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in AppendEntries")
-		cm.becomeFollower(args.Term)
-	}
-	reply.Success = false
-	if args.Term == cm.currentTerm { // 任期相同
-		//Q: What if this peer is a leader - why does it become a follower to another leader?
-		//
-		//A: Raft guarantees that only a single leader exists in any given term.
-		// If you carefully follow the logic of RequestVote and the code in startElection that sends RVs,
-		// you'll see that two leaders can't exist in the cluster with the same term.
-		// This condition is important for candidates that find out that
-		// another peer won the election for this term.
-		if cm.state != Follower { // 收到了心跳请求，但是我不是 Follower，那么直接成为 Follower
-			cm.becomeFollower(args.Term)
-		}
-		// 收到了 leader 心跳，则重置选举时间
-		cm.electionResetEvent = time.Now()
-
-		if args.PrevLogIndex == -1 || // -1 代表未同步过日志
-			// 同步的日志序号小于当前端点的日志长度 且 同步的任期与日志的任期是一致的
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
-			reply.Success = true                    // 心跳成功
-			logInsertIndex := args.PrevLogIndex + 1 // 插入日志的序号
-			newEntriesIndex := 0                    // Entries 序号，与 logInsertIndex 一一对应
-
-			for {
-				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
-					break
-				}
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
-					break
-				}
-				logInsertIndex++
-				newEntriesIndex++
-			}
-			// 待插入的日志个数得小于心跳中的日志数量
-			if newEntriesIndex < len(args.Entries) {
-				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.dlog("... log is now: %v", cm.log)
-			}
-			// 如果 leader 的提交序号大于当前节点的提交序号
-			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1) // 更新 commitIndex
-				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
-				cm.newCommitReadyChan <- struct{}{}
-			}
-		}
-	}
-
-	reply.Term = cm.currentTerm
-	cm.dlog("AppendEntries reply: %+v", *reply)
-	return nil
-}
-
-// leader 发送心跳
-func (cm *ConsensusModule) leaderSendAEs() {
+// leader 发送 AppendEntries，如果 Entries 为空，则发送心跳
+func (cm *ConsensusModule) sendAppendEntries() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
@@ -511,40 +414,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
 	}
 }
 
-// 当 commitIndex 更新
-func (cm *ConsensusModule) commitChanSender() {
-	for range cm.newCommitReadyChan {
-		cm.mu.Lock()
-		savedTerm := cm.currentTerm
-		savedLastApplied := cm.lastApplied
-		var entries []LogEntry
-		if cm.commitIndex > cm.lastApplied {
-			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1] // 需要应用的日志
-			cm.lastApplied = cm.commitIndex
-		}
-		cm.mu.Unlock()
-		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
-
-		for i, entry := range entries {
-			cm.commitChan <- CommitEntry{
-				Command: entry.Command,
-				Index:   savedLastApplied + i + 1,
-				Term:    savedTerm,
-			}
-		}
-	}
-	cm.dlog("commitChanSender done")
-}
-
-// 获得最后的日志序号和任期
-func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
-	} else {
-		return -1, -1 // -1 表示还没有任何数据
-	}
-}
+//
+// ConsensusModule 状态持久化与恢复
+//
 
 // 持久化数据
 func (cm *ConsensusModule) persistToStorage() {
@@ -595,9 +467,163 @@ func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
 	}
 }
 
-func intMin(a, b int) int {
-	if a < b {
-		return a
+//
+// RPC 结构体定义与函数 Call
+//
+
+// 选举投票请求
+type RequestVoteArgs struct {
+	Term         int // 请求者任期
+	CandidateId  int // 请求者id
+	LastLogIndex int // 请求者最后一个日志的序号
+	LastLogTerm  int // 请求者最后一个日志的任期
+}
+
+// 选举投票回复
+type RequestVoteReply struct {
+	Term         int  // 回复者任期
+	VotedGranted bool // 是否投票
+}
+
+// 请求投票 RPC
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	// 死亡状态，直接返回
+	if cm.state == Dead {
+		return nil
 	}
-	return b
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+	// 如果对方的任期大于当前任期，直接变成 Follower
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+	// 如果对方的任期等于当前任期 且 （当前未投票 或者 投票的人正是发请求的人）
+	// 那么将当前任期的一票投给请求者
+	if cm.currentTerm == args.Term &&
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+		reply.VotedGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now() // 票已投，当前选举结束，进入下一个选举
+	} else { // 其它的情况，都不进行投票
+		reply.VotedGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.dlog("... RequestVote: %+v", reply)
+	return nil
+}
+
+// 注意：AppendEntries 无论作为心跳还是与 follower 同步日志，都只能由 leader 发出
+type AppendEntriesArgs struct {
+	Term     int // leader 任期
+	LeaderId int // leader id
+
+	PrevLogIndex int        // leader 中当前 peer 的上一个日志序号
+	PrevLogTerm  int        // leader 中当前 peer 的上一个日志任期
+	Entries      []LogEntry // 同步日志
+	LeaderCommit int        // leader commit index
+}
+
+type AppendEntriesReply struct {
+	Term    int  // 回复者任期
+	Success bool // 日志同步是否成功
+}
+
+// 处理追加日志请求
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("AppendEntries: %+v", args)
+	// 如果请求者的任期比我大，直接成为 Follower
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+	reply.Success = false
+	if args.Term == cm.currentTerm { // 任期相同
+		//Q: What if this peer is a leader - why does it become a follower to another leader?
+		//
+		//A: Raft guarantees that only a single leader exists in any given term.
+		// If you carefully follow the logic of RequestVote and the code in startElection that sends RVs,
+		// you'll see that two leaders can't exist in the cluster with the same term.
+		// This condition is important for candidates that find out that
+		// another peer won the election for this term.
+		if cm.state != Follower { // 收到了心跳请求，但是我不是 Follower，那么直接成为 Follower
+			cm.becomeFollower(args.Term)
+		}
+		// 收到了 leader 心跳，则重置选举时间
+		cm.electionResetEvent = time.Now()
+
+		if args.PrevLogIndex == -1 || // -1 代表未同步过日志
+			// 同步的日志序号小于当前端点的日志长度 且 同步的任期与日志的任期是一致的
+			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			reply.Success = true                    // 心跳成功
+			logInsertIndex := args.PrevLogIndex + 1 // 插入日志的序号
+			newEntriesIndex := 0                    // Entries 序号，与 logInsertIndex 一一对应
+
+			for {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+			// 待插入的日志个数得小于心跳中的日志数量
+			if newEntriesIndex < len(args.Entries) {
+				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.dlog("... log is now: %v", cm.log)
+			}
+			// 如果 leader 的提交序号大于当前节点的提交序号
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1) // 更新 commitIndex
+				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+		}
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("AppendEntries reply: %+v", *reply)
+	return nil
+}
+
+//
+// ConsensusModule 基础函数
+//
+
+// 获得最后的日志序号和任期
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
+	} else {
+		return -1, -1 // -1 表示还没有任何数据
+	}
+}
+
+// 随机返回选举超时时间，150ms ～ 300ms
+func (cm *ConsensusModule) electionTimeout() time.Duration {
+	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
+		return time.Duration(150) * time.Millisecond
+	} else {
+		return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	}
+}
+
+// Debug 输出日志信息
+func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
+	if DebugCM > 0 {
+		format = fmt.Sprintf("[%d] ", cm.id) + format
+		log.Printf(format, args...)
+	}
 }

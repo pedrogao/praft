@@ -10,8 +10,9 @@ type Storage interface {
 	HasData() bool
 }
 
+// Storage 基于内存，供测试使用
 type MapStorage struct {
-	mu sync.Mutex
+	mu sync.Mutex // 比较粗暴，直接一把大锁
 	m  map[string][]byte
 }
 
