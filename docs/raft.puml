@@ -1,0 +1,12 @@
+@startuml
+
+state Raft节点状态转移 {
+    Candidate --> Candidate : 选举超时
+    Follower --> Candidate : 心跳超时，没有收到 Leader 心跳
+    Follower: 启动时状态
+    Leader --> Follower : 遇到新主，任期大
+    Leader: 皇帝、我说的就是圣旨
+    Candidate --> Leader : 拿到多数票
+}
+
+@enduml

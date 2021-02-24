@@ -1,0 +1,55 @@
+@startuml
+
+class ConsensusModule {
+  .. common functions ..
+  + Submit(command interface{}) bool
+  + Report() (id int, term int, isLeader bool)
+  + Stop()
+  + runElectionTimer()
+  + startElection()
+  + becomeFollower(term int)
+  + commitLoop()
+  .. leader only ..
+  + startLeader()
+  + sendAppendEntries()
+  .. persist ..
+  + persistToStorage()
+  + restoreFromStorage(storage Storage)
+  .. RPC ..
+  + RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error
+  + AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error
+  .. helper functions ..
+  + lastLogIndexAndTerm() (int, int)
+  + electionTimeout() time.Duration
+  + dlog(format string, args ...interface{})
+
+  __ private data __
+  id      int        // 当前模块id
+  peerIds []int      // 集群端点id
+  server  *Server    // RPC server
+
+  __ sync channel __
+  commitChan chan<- CommitEntry // 提交队列
+  newCommitReadyChan chan struct{} // 新提交准备
+  triggerAEChan      chan struct{} // AppendEntries 需要发送
+
+  __ persistent Raft state __
+  currentTerm int        // 当前任期
+  votedFor    int        // 给谁投过票
+  log         []LogEntry // 日志
+
+  __ volatile state __
+  commitIndex        int       // 已提交日志序号
+  lastApplied        int       // 最后应用日志序号
+  state              CMState   // 当前角色状态
+  electionResetEvent time.Time // 选举时间
+
+  __ volatile Raft leader state __
+  nextIndex  map[int]int // 下一个日志序号
+  matchIndex map[int]int // 已匹配日志序号
+
+  __ persistence __
+  storage Storage
+}
+
+@enduml
